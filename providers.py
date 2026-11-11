@@ -1,6 +1,10 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
+import http.client
 import os
+import socket
+import time
+from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.request
 
@@ -13,15 +17,51 @@ CONFIG = {
 
 
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    encoded_payload = json.dumps(payload).encode()
+    max_attempts = 3  # Original request plus at most two retries.
+    retryable_statuses = {429, 500, 502, 503, 504}
+
+    def retry_after_seconds(value):
+        if not value:
+            return None
+        try:
+            return max(0, float(value))
+        except (TypeError, ValueError):
+            try:
+                return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(
+            url, data=encoded_payload,
+            headers={'Content-Type': 'application/json', **headers},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Do not print response bodies: they may contain account or request data.
+            if exc.code in retryable_statuses and attempt < max_attempts - 1:
+                delay = retry_after_seconds(exc.headers.get('Retry-After'))
+                if delay is None:
+                    delay = 1 * (2 ** attempt)
+                # Avoid sleeping through a long server-suggested cooldown. Surface the
+                # status instead so callers can retry later without hammering the API.
+                if delay <= 10:
+                    time.sleep(delay)
+                    continue
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (TimeoutError, socket.timeout, http.client.RemoteDisconnected, ConnectionError) as exc:
+            if attempt < max_attempts - 1:
+                time.sleep(1 * (2 ** attempt))
+                continue
+            raise RuntimeError('Provider timeout hoặc ngắt kết nối sau khi thử lại.') from exc
+        except urllib.error.URLError as exc:
+            if attempt < max_attempts - 1:
+                time.sleep(1 * (2 ** attempt))
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
